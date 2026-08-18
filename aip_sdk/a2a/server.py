@@ -30,6 +30,29 @@ from a2a.client.helpers import create_text_message_object
 from .types import StreamResponse, A2AErrorCode, InvokeRequest, InvokeResponse
 
 
+def job_completion_body(job_id, agent_id, result, chain_id, error):
+    """Build the POST /gateway/jobs/complete request body.
+
+    When ``error`` is set the job is reported failed with an empty result;
+    ``chain_id`` is included only for multi-chain (chain_id is not None). This is
+    the SDK→gateway wire contract, mirrored across the Go/Python/TS SDKs
+    (see contracts/fixtures/job_completion.json).
+    """
+    body = {
+        "job_id": job_id,
+        "agent_id": agent_id,
+        "result": result,
+        "status": "completed",
+    }
+    if chain_id is not None:
+        body["chain_id"] = chain_id
+    if error:
+        body["status"] = "failed"
+        body["error"] = error
+        body["result"] = {}
+    return body
+
+
 class A2AServer:
     """A2A-compliant server for exposing Unibase agents."""
 
@@ -1171,14 +1194,9 @@ class A2AServer:
             }
 
             # Submit result back to Gateway job queue
-            complete_body = {
-                "job_id": job_id,
-                "agent_id": job_data.get("agent_id"),
-                "result": result_payload,
-                "status": "completed",
-            }
-            if chain_id is not None:
-                complete_body["chain_id"] = chain_id
+            complete_body = job_completion_body(
+                job_id, job_data.get("agent_id"), result_payload, chain_id, None
+            )
             await client.post(complete_endpoint, json=complete_body)
 
             logger.info(f"Job {job_id} completed and result submitted to job queue (chain {chain_id})")
@@ -1188,13 +1206,7 @@ class A2AServer:
             try:
                 await client.post(
                     complete_endpoint,
-                    json={
-                        "job_id": job_id,
-                        "agent_id": job_data.get("agent_id"),
-                        "result": {},
-                        "status": "failed",
-                        "error": str(e),
-                    }
+                    json=job_completion_body(job_id, job_data.get("agent_id"), {}, chain_id, str(e)),
                 )
             except Exception:
                 pass
