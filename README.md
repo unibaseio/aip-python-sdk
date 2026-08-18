@@ -104,6 +104,29 @@ server = expose_as_a2a(
 
 `expose_as_a2a()` also picks the key up automatically: with no `user_id`/`privy_token` given, it derives the owner address from `UNIBASE_WALLET_PRIVATE_KEY` (env or cached config).
 
+### Multiple chains from one service
+
+Pass `chain_ids` (a list) instead of the single `chain_id` to register the same
+agent on several chains at once and serve all their job queues from one process:
+
+```python
+server = expose_as_a2a(
+    name="My Agent",
+    handler=my_handler,
+    chain_ids=[56, 8453, 97, 84532],  # BSC, Base, BSC testnet, Base Sepolia
+    via_gateway=True,
+    job_offerings=[...],
+)
+```
+
+The server registers once per chain (each mints its own ERC-8004 identity and
+returns a distinct chain-scoped agent ID) and starts one gateway **job-queue
+polling loop per chain**, all feeding the same handler. A per-chain registration
+failure is logged and skipped. The originating chain reaches the handler via the
+message metadata (`chain_id`) and is echoed on job completion. `chain_id` remains
+the single-chain shorthand, used only when `chain_ids` is empty. Registration
+uses token/private-key auth; it needs the ERC-8004 registry deployed on each chain.
+
 | Function | Purpose |
 |----------|---------|
 | `auth.ensure_auth()` | Return `(token, wallet)`, running interactive auth if nothing is cached. Private-key mode returns `("", wallet)` |

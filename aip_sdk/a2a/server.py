@@ -55,10 +55,13 @@ class A2AServer:
 
         # Registration state
         self._agent_id: Optional[str] = None
+        # Per-chain registrations: list of (chain_id, agent_id) tuples.
+        self._registrations: List[tuple] = []
         self._aip_client = None
 
         # Gateway polling state
         self._polling_task: Optional[asyncio.Task] = None
+        self._polling_tasks: List[asyncio.Task] = []
         self._should_poll = False
 
         # Create FastAPI app
@@ -132,18 +135,19 @@ class A2AServer:
                     logger.info(f"  Agent Handle: {self.registration_config.get('handle')}")
                     logger.info(f"  job_offerings: {has_job_offerings}, via_gateway: {via_gateway}")
                     self._should_poll = True
-                    self._polling_task = asyncio.create_task(self._gateway_polling_loop())
+                    self._start_polling(use_job_queue)
 
             yield
 
             # Cleanup on shutdown
             self._should_poll = False
-            if self._polling_task:
-                self._polling_task.cancel()
+            for task in self._polling_tasks:
+                task.cancel()
                 try:
-                    await self._polling_task
+                    await task
                 except asyncio.CancelledError:
                     pass
+            self._polling_tasks = []
             if self._aip_client:
                 await self._aip_client.close()
             logger.info("A2A Server shutting down")
@@ -991,44 +995,76 @@ class A2AServer:
             job_resources_raw = config.get("job_resources", [])
             job_resources = [AgentJobResource.model_validate(r) for r in job_resources_raw]
 
-            agent_config = AgentConfig(
-                name=config["name"],
-                handle=handle,
-                description=config.get("description", ""),
-                endpoint_url=endpoint_url,
-                skills=skills,
-                cost_model=cost_model,
-                currency=config.get("currency", "USD"),
-                metadata=config.get("metadata", {}),
-                job_offerings=job_offerings,
-                job_resources=job_resources,
-                chain_id=config.get("chain_id", 97),
-            )
+            # Register once per chain (token auth): each chain mints a distinct
+            # ERC-8004 identity and returns its own chain-scoped agent ID. A
+            # failure on one chain is logged and skipped so the others come up.
+            chain_ids = config.get("chain_ids") or [config.get("chain_id", 97)]
+            registrations = []
+            for chain_id in chain_ids:
+                agent_config = AgentConfig(
+                    name=config["name"],
+                    handle=handle,
+                    description=config.get("description", ""),
+                    endpoint_url=endpoint_url,
+                    skills=skills,
+                    cost_model=cost_model,
+                    currency=config.get("currency", "USD"),
+                    metadata=config.get("metadata", {}),
+                    job_offerings=job_offerings,
+                    job_resources=job_resources,
+                    chain_id=chain_id,
+                )
+                logger.info(f"Registering agent on chain {chain_id} (handle erc8004:{handle})")
+                try:
+                    result = await self._aip_client.register_agent(
+                        agent_config,
+                        user_id=user_id,
+                        privy_token=privy_token,
+                        signature=config.get("signature"),
+                        message=config.get("message"),
+                    )
+                except Exception as e:
+                    logger.warning(f"AIP registration failed on chain {chain_id} (skipping): {e}")
+                    continue
+                agent_id = result.get("agent_id", f"{chain_id}:erc8004:{handle}")
+                registrations.append((chain_id, agent_id))
+                logger.info(f"Agent registered on chain {chain_id}: {agent_id}")
 
-            # Register with platform (uses POST /agents/register)
-            result = await self._aip_client.register_agent(
-                agent_config,
-                user_id=user_id,
-                privy_token=privy_token,
-                signature=config.get("signature"),
-                message=config.get("message"),
-            )
-            self._agent_id = result.get("agent_id", f"erc8004:{handle}")
-
-            logger.info(f"Agent registered successfully: {self._agent_id}")
+            self._registrations = registrations
+            if registrations:
+                self._agent_id = registrations[0][1]
 
         except Exception as e:
             logger.warning(f"AIP registration failed (agent will run without registration): {e}")
             # Don't fail startup - agent can still work without platform registration
 
-    async def _gateway_polling_loop(self):
-        """Poll Gateway for tasks or job assignments (for private agents behind firewall).
+    def _start_polling(self, use_job_queue: bool):
+        """Launch the gateway polling loops.
 
-        Two modes:
-        - Job queue mode: agent has job_offerings or via_gateway=True
-          → polls GET /gateway/jobs/poll, submits to POST /gateway/jobs/complete
-        - Task queue mode: agent has no job_offerings
-          → polls GET /gateway/tasks/poll, submits to POST /gateway/tasks/complete
+        In job-queue mode, start one loop per registered chain (each chain has
+        its own chain-scoped agent_id and job queue); in task-queue mode, start
+        a single loop keyed by handle. Falls back to a single handle-keyed loop
+        when there are no registrations (registration disabled or all failed).
+        """
+        handle = self.registration_config.get("handle")
+        if not use_job_queue:
+            self._polling_tasks.append(
+                asyncio.create_task(self._gateway_polling_loop(handle, None, False))
+            )
+            return
+        if not self._registrations:
+            self._polling_tasks.append(
+                asyncio.create_task(self._gateway_polling_loop(handle, None, True))
+            )
+            return
+        for chain_id, agent_id in self._registrations:
+            self._polling_tasks.append(
+                asyncio.create_task(self._gateway_polling_loop(agent_id, chain_id, True))
+            )
+
+    async def _gateway_polling_loop(self, poll_agent: str, chain_id: Optional[int], use_job_queue: bool):
+        """Poll the Gateway for jobs (job queue) or tasks (task queue) for a
+        single agent_id. chain_id is None when not applicable.
         """
         try:
             import httpx
@@ -1038,52 +1074,33 @@ class A2AServer:
 
         config = self.registration_config
         gateway_url = config.get("gateway_url")
-        handle = config.get("handle")
-        # Use the registered agent_id (e.g. "97:0x8004...:578") if available,
-        # falling back to handle (e.g. "binance_price_polling").
-        # This is critical for ERC-8183 job queue: Butler submits with the
-        # chain-scoped agent_id, so the SDK must poll with the same ID so the
-        # gateway's _handle_from_agent_id() extracts the same token ID.
-        agent_id_for_poll = self._agent_id or handle
         poll_interval = 3.0
-
-        # Decide polling mode based on job_offerings or via_gateway flag
-        has_job_offerings = bool(config.get("job_offerings"))
-        via_gateway = config.get("via_gateway", False)
-        use_job_queue = has_job_offerings or via_gateway
 
         if use_job_queue:
             poll_endpoint = f"{gateway_url}/gateway/jobs/poll"
             complete_endpoint = f"{gateway_url}/gateway/jobs/complete"
-            logger.info(f"Starting Gateway JOB-QUEUE polling loop for agent {agent_id_for_poll}")
-            logger.info(f"  (job_offerings={has_job_offerings}, via_gateway={via_gateway})")
+            logger.info(f"Starting Gateway JOB-QUEUE polling loop for agent {poll_agent} (chain {chain_id})")
         else:
             poll_endpoint = f"{gateway_url}/gateway/tasks/poll"
             complete_endpoint = f"{gateway_url}/gateway/tasks/complete"
-            logger.info(f"Starting Gateway TASK-QUEUE polling loop for agent {handle}")
+            logger.info(f"Starting Gateway TASK-QUEUE polling loop for agent {poll_agent}")
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             while self._should_poll:
                 try:
-                    if use_job_queue:
-                        response = await client.get(
-                            poll_endpoint,
-                            params={"agent": agent_id_for_poll, "timeout": 5.0}
-                        )
-                    else:
-                        response = await client.get(
-                            poll_endpoint,
-                            params={"agent": handle, "timeout": 5.0}
-                        )
+                    response = await client.get(
+                        poll_endpoint,
+                        params={"agent": poll_agent, "timeout": 5.0}
+                    )
 
                     if response.status_code == 200:
                         data = response.json()
                         task_id = data.get("task_id") or data.get("job_id")
 
                         if task_id:
-                            logger.info(f"Received assignment {task_id} from Gateway (job_queue={use_job_queue})")
+                            logger.info(f"Received assignment {task_id} from Gateway (agent={poll_agent}, chain={chain_id}, job_queue={use_job_queue})")
                             if use_job_queue:
-                                await self._process_gateway_job(task_id, data, gateway_url, client, complete_endpoint)
+                                await self._process_gateway_job(task_id, data, gateway_url, client, complete_endpoint, chain_id)
                             else:
                                 await self._process_gateway_task(task_id, data, gateway_url, client)
                         else:
@@ -1098,7 +1115,7 @@ class A2AServer:
 
         logger.info("Gateway polling loop stopped")
 
-    async def _process_gateway_job(self, job_id: str, job_data: Dict, gateway_url: str, client, complete_endpoint: str):
+    async def _process_gateway_job(self, job_id: str, job_data: Dict, gateway_url: str, client, complete_endpoint: str, chain_id: Optional[int] = None):
         """Process a job assignment received from the job queue."""
         try:
             # Extract the actual work from job_data
@@ -1107,15 +1124,17 @@ class A2AServer:
 
             # Build a task-like structure for the handler
             # Message requires messageId and role per A2A spec
+            message = {
+                "messageId": str(uuid.uuid4()),
+                "role": "user",
+                "parts": [{"kind": "text", "text": job_input}],
+            }
+            # Surface the originating chain to the handler via message metadata.
+            if chain_id is not None:
+                message["metadata"] = {"chain_id": chain_id}
             rpc_request = {
                 "method": payload.get("method", "message/send"),
-                "params": {
-                    "message": {
-                        "messageId": str(uuid.uuid4()),
-                        "role": "user",
-                        "parts": [{"kind": "text", "text": job_input}],
-                    }
-                },
+                "params": {"message": message},
                 "id": job_id,
             }
 
@@ -1152,17 +1171,17 @@ class A2AServer:
             }
 
             # Submit result back to Gateway job queue
-            await client.post(
-                complete_endpoint,
-                json={
-                    "job_id": job_id,
-                    "agent_id": job_data.get("agent_id"),
-                    "result": result_payload,
-                    "status": "completed",
-                }
-            )
+            complete_body = {
+                "job_id": job_id,
+                "agent_id": job_data.get("agent_id"),
+                "result": result_payload,
+                "status": "completed",
+            }
+            if chain_id is not None:
+                complete_body["chain_id"] = chain_id
+            await client.post(complete_endpoint, json=complete_body)
 
-            logger.info(f"Job {job_id} completed and result submitted to job queue")
+            logger.info(f"Job {job_id} completed and result submitted to job queue (chain {chain_id})")
 
         except Exception as e:
             logger.error(f"Error processing job {job_id}: {e}")
