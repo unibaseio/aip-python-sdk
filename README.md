@@ -28,9 +28,17 @@ The **Unibase AIP SDK** is a unified Python library that provides two core capab
 - **Python**: 3.10 or higher
 - **Package Manager**: `uv` (recommended) or `pip`
 
+Install straight from git (the package is not on PyPI yet):
+
 ```bash
-git clone https://github.com/unibase/unibase-aip.git
-cd unibase-aip/packages/unibase-aip-sdk
+pip install git+https://github.com/unibaseio/aip-python-sdk.git
+```
+
+Or clone it for local development, which gives you the `examples/` too:
+
+```bash
+git clone https://github.com/unibaseio/aip-python-sdk.git
+cd aip-python-sdk
 uv pip install -e .
 ```
 
