@@ -78,6 +78,9 @@ class A2AServer:
 
         # Registration state
         self._agent_id: Optional[str] = None
+        # agent_id -> gateway queue token from POST /agents/register; sent as
+        # X-Agent-Token so only this agent can poll/complete its jobs.
+        self._gateway_tokens: Dict[str, str] = {}
         # Per-chain registrations: list of (chain_id, agent_id) tuples.
         self._registrations: List[tuple] = []
         self._aip_client = None
@@ -1050,6 +1053,8 @@ class A2AServer:
                     logger.warning(f"AIP registration failed on chain {chain_id} (skipping): {e}")
                     continue
                 agent_id = result.get("agent_id", f"{chain_id}:erc8004:{handle}")
+                if result.get("gateway_token"):
+                    self._gateway_tokens[agent_id] = result["gateway_token"]
                 registrations.append((chain_id, agent_id))
                 logger.info(f"Agent registered on chain {chain_id}: {agent_id}")
 
@@ -1108,7 +1113,9 @@ class A2AServer:
             complete_endpoint = f"{gateway_url}/gateway/tasks/complete"
             logger.info(f"Starting Gateway TASK-QUEUE polling loop for agent {poll_agent}")
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        token = self._gateway_tokens.get(poll_agent) if use_job_queue else None
+        headers = {"X-Agent-Token": token} if token else {}
+        async with httpx.AsyncClient(timeout=30.0, headers=headers) as client:
             while self._should_poll:
                 try:
                     response = await client.get(
